@@ -1,3 +1,3 @@
-module github.com/max-chem-eng/more-sync
+module github.com/max-chem-eng/gomoresync
 
 go 1.22.1
