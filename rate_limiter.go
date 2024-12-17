@@ -3,7 +3,6 @@ package gomoresync
 import (
 	"context"
 	"errors"
-	"sync"
 	"time"
 )
 
@@ -13,15 +12,12 @@ type RateLimiter interface {
 	Allow() bool
 }
 
-// TokenBucketLimiter implements a token bucket algorithm.
+// TokenBucketLimiter implements a token bucket algorithm using channels.
 type TokenBucketLimiter struct {
 	capacity     int           // maximum tokens
-	tokens       int           // current tokens
+	tokens       chan struct{} // channel to represent tokens
 	fillInterval time.Duration // how often to add 1 token
-	mu           sync.Mutex
-	cond         *sync.Cond
-	closed       bool
-	stopCh       chan struct{}
+	closed       chan struct{}
 }
 
 // NewTokenBucketLimiter creates a token bucket that refills one token
@@ -36,11 +32,15 @@ func NewTokenBucketLimiter(capacity int, fillInterval time.Duration) (*TokenBuck
 
 	tb := &TokenBucketLimiter{
 		capacity:     capacity,
-		tokens:       capacity, // start full
+		tokens:       make(chan struct{}, capacity),
 		fillInterval: fillInterval,
-		stopCh:       make(chan struct{}),
+		closed:       make(chan struct{}),
 	}
-	tb.cond = sync.NewCond(&tb.mu)
+
+	// Fill the tokens channel to capacity
+	for i := 0; i < capacity; i++ {
+		tb.tokens <- struct{}{}
+	}
 
 	// Start a background goroutine to refill tokens
 	go tb.refillTokens()
@@ -54,80 +54,43 @@ func (tb *TokenBucketLimiter) refillTokens() {
 
 	for {
 		select {
-		case <-tb.stopCh:
+		case <-tb.closed:
 			return
 		case <-ticker.C:
-			tb.mu.Lock()
-			if tb.closed {
-				tb.mu.Unlock()
-				return
+			select {
+			case tb.tokens <- struct{}{}:
+			default:
+				// tokens channel is full, do nothing
 			}
-			if tb.tokens < tb.capacity {
-				tb.tokens++
-				tb.cond.Broadcast()
-			}
-			tb.mu.Unlock()
 		}
 	}
 }
 
 // Wait blocks until a token becomes available or ctx is canceled.
 func (tb *TokenBucketLimiter) Wait(ctx context.Context) error {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-
-	for {
-		// If the limiter was closed, return
-		if tb.closed {
-			return errors.New("token bucket limiter is closed")
-		}
-
-		if tb.tokens > 0 {
-			tb.tokens--
-			return nil
-		}
-
-		// No tokens available; need to wait.
-		waitCh := make(chan struct{})
-		go func() {
-			tb.cond.Wait()
-			close(waitCh)
-		}()
-
-		select {
-		case <-ctx.Done():
-			// Cancel the waiting goroutine
-			tb.cond.Broadcast() // unblock any waiting goroutine
-			return ctx.Err()
-		case <-waitCh:
-			// We were signaled; re-check loop condition
-		}
+	select {
+	case <-tb.closed:
+		return errors.New("token bucket limiter is closed")
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-tb.tokens:
+		return nil
 	}
 }
 
 // Allow is a non-blocking check if a token is available. Returns true if token is acquired.
 func (tb *TokenBucketLimiter) Allow() bool {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-
-	if tb.closed {
+	select {
+	case <-tb.closed:
+		return false
+	case <-tb.tokens:
+		return true
+	default:
 		return false
 	}
-
-	if tb.tokens > 0 {
-		tb.tokens--
-		return true
-	}
-	return false
 }
 
 // Close stops the refill goroutine and marks the limiter as closed.
 func (tb *TokenBucketLimiter) Close() {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-	if !tb.closed {
-		tb.closed = true
-		close(tb.stopCh)
-		tb.cond.Broadcast()
-	}
+	close(tb.closed)
 }
