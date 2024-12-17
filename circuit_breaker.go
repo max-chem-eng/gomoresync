@@ -41,13 +41,17 @@ type CircuitBreakerConfig struct {
 // CircuitBreaker implements a simplistic circuit breaker pattern.
 type CircuitBreaker struct {
 	config CircuitBreakerConfig
-	state  int32 // atomic state
-	mu     sync.Mutex
-	// counters
+
+	state int32 // atomic for StateClosed, StateOpen, StateHalfOpen
+
+	mu           sync.Mutex
 	failCount    int
 	successCount int
-	// for open -> halfOpen
+
 	lastOpenTime time.Time
+
+	// halfOpenActive tracks how many calls are currently allowed in half-open
+	halfOpenActive int32
 }
 
 // NewCircuitBreaker creates a new CircuitBreaker with the specified config.
@@ -59,16 +63,17 @@ func NewCircuitBreaker(cfg CircuitBreakerConfig) *CircuitBreaker {
 		cfg.SuccessThreshold = 1
 	}
 	if cfg.OpenTimeout <= 0 {
-		cfg.OpenTimeout = 10 * time.Second
+		cfg.OpenTimeout = 5 * time.Second
 	}
 	if cfg.HalfOpenMaxCalls <= 0 {
 		cfg.HalfOpenMaxCalls = 1
 	}
 
-	return &CircuitBreaker{
+	cb := &CircuitBreaker{
 		config: cfg,
 		state:  int32(StateClosed),
 	}
+	return cb
 }
 
 // Do attempts the operation if the circuit breaker allows it.
@@ -79,32 +84,33 @@ func (cb *CircuitBreaker) Do(ctx context.Context, operation func() error) error 
 
 	switch state {
 	case StateOpen:
-		// Check if we can move to HalfOpen
+		// Check if OpenTimeout has elapsed
+		cb.mu.Lock()
 		if time.Since(cb.lastOpenTime) >= cb.config.OpenTimeout {
 			cb.transitionTo(StateHalfOpen)
 		} else {
+			cb.mu.Unlock()
 			return errors.New("circuit breaker is open")
 		}
+		cb.mu.Unlock()
+
 	case StateHalfOpen:
-		// We could limit concurrency or calls here. For simplicity, if HalfOpenMaxCalls is > 1,
-		// you might track the current half-open calls.
-		// We'll do a quick concurrency guard:
-		cb.mu.Lock()
-		if cb.failCount+cb.successCount >= cb.config.HalfOpenMaxCalls {
-			cb.mu.Unlock()
+		// Safely enforce concurrency limit in HalfOpen
+		active := atomic.LoadInt32(&cb.halfOpenActive)
+		if active >= int32(cb.config.HalfOpenMaxCalls) {
 			return errors.New("circuit breaker half-open: max calls reached")
 		}
-		cb.mu.Unlock()
+		atomic.AddInt32(&cb.halfOpenActive, 1)
+		defer atomic.AddInt32(&cb.halfOpenActive, -1)
 	}
 
-	// Perform the operation
 	err := operation()
-	if err != nil {
-		cb.onFailure()
-		return err
+	if err == nil {
+		cb.onSuccess()
+		return nil
 	}
-	cb.onSuccess()
-	return nil
+	cb.onFailure()
+	return err
 }
 
 func (cb *CircuitBreaker) onFailure() {
@@ -113,16 +119,13 @@ func (cb *CircuitBreaker) onFailure() {
 
 	cb.failCount++
 	cb.successCount = 0
+	curr := cb.currentState()
 
-	// If in HalfOpen, transition immediately to Open if fail
-	if cb.currentState() == StateHalfOpen {
+	if curr == StateHalfOpen {
+		// Immediately transition back to open
 		cb.transitionTo(StateOpen)
 		cb.lastOpenTime = time.Now()
-		return
-	}
-
-	// If Closed, check threshold
-	if cb.currentState() == StateClosed && cb.failCount >= cb.config.FailureThreshold {
+	} else if curr == StateClosed && cb.failCount >= cb.config.FailureThreshold {
 		cb.transitionTo(StateOpen)
 		cb.lastOpenTime = time.Now()
 	}
@@ -133,18 +136,16 @@ func (cb *CircuitBreaker) onSuccess() {
 	defer cb.mu.Unlock()
 
 	cb.successCount++
-	// If in HalfOpen, we might close the breaker after enough successes
+
 	if cb.currentState() == StateHalfOpen {
+		// If success threshold reached, close breaker
 		if cb.successCount >= cb.config.SuccessThreshold {
 			cb.transitionTo(StateClosed)
 			cb.failCount = 0
 			cb.successCount = 0
 		}
-		return
-	}
-
-	// If in Closed, reset counters
-	if cb.currentState() == StateClosed {
+	} else if cb.currentState() == StateClosed {
+		// Normal closed state, reset failures
 		cb.failCount = 0
 	}
 }
