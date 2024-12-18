@@ -345,8 +345,6 @@ func (p *Pool) Resize(newMaxWorkers int) error {
 			go p.workerLoop()
 		}
 	}
-	// Let workers exit naturally by feeding no additional tasks.
-	// The newly 'excess' workers will eventually exit once tasksChan is drained,
-	// or once the pool is shut down. There’s no immediate forced kill here.
+	// TODO: evaluate if we need to signal workers to exit if newMaxWorkers <= current
 	return nil
 }
