@@ -10,7 +10,9 @@ import (
 type SubmitBehavior int
 
 const (
+	// SubmitBlock blocks until there is space in the task queue.
 	SubmitBlock SubmitBehavior = iota
+	// SubmitError returns an error if the task queue is full.
 	SubmitError
 )
 
