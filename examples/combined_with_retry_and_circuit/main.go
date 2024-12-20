@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,7 +16,7 @@ import (
 )
 
 func main() {
-	rand.Seed(time.Now().UnixNano()) // for jitter backoff randomness
+	// rand.Seed(time.Now().UnixNano()) // for jitter backoff randomness
 
 	// 1. Create a top-level context that we’ll cancel on SIGINT/SIGTERM for graceful shutdown
 	rootCtx, cancel := context.WithCancel(context.Background())
