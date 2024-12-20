@@ -148,8 +148,9 @@ type Pool struct {
 	submitBehavior  SubmitBehavior
 	errorAggregator ErrorAggregator
 	observer        Observer
-
-	taskIDCounter int
+	taskIDCounter   int
+	rootCtx         context.Context
+	rootCancel      context.CancelFunc
 }
 
 type taskWrapper struct {
@@ -185,12 +186,16 @@ func NewPool(options ...PoolOption) (*Pool, error) {
 		cfg.Observer = nopObserver{}
 	}
 
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+
 	p := &Pool{
 		maxWorkers:      cfg.MaxWorkers,
 		submitBehavior:  cfg.SubmitBehavior,
 		errorAggregator: cfg.ErrorAggregator,
 		observer:        cfg.Observer,
 		tasksChan:       make(chan taskWrapper, cfg.BufferSize),
+		rootCtx:         rootCtx,
+		rootCancel:      rootCancel,
 	}
 
 	p.startWorkers()
@@ -236,6 +241,7 @@ func (p *Pool) captureError(err error) {
 // Shutdown attempts to finish all existing tasks and close the pool.
 // If the provided context is canceled before all tasks are complete,
 // Shutdown returns a context error. Otherwise, it returns any errors from tasks.
+// It reads/writes p.closed and closes p.tasksChan under lock.
 func (p *Pool) Shutdown(ctx context.Context) error {
 	p.mu.Lock()
 	if p.closed {
@@ -255,6 +261,10 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		// Cancel all tasks so they don't outlive the pool
+		p.rootCancel()
+		// Wait briefly for tasks to acknowledge cancellation
+		// But we don't block indefinitely, just return the error
 		return ctx.Err()
 	case <-doneCh:
 		return p.errorAggregator.Error()
@@ -263,45 +273,48 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 
 // Submit schedules a task for execution in the worker pool.
 // The task is a function that receives a context, so it can respect cancellation/timeouts.
+// Submit checks p.closed under lock and interacts with p.tasksChan under lock.
 func (p *Pool) Submit(ctx context.Context, task func(ctx context.Context) error) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.closed {
+		p.mu.Unlock()
 		return errors.New("cannot submit task to a closed worker pool")
 	}
 
-	// Increment a local task ID for debugging/observer usage
 	p.taskIDCounter++
-	id := p.taskIDCounter
+	taskID := p.taskIDCounter
+	p.mu.Unlock()
 
-	// Behavior control
+	// Derive a context for the task that cancels if either the user ctx or rootCtx cancels.
+	taskCtx, taskCancel := context.WithCancel(p.rootCtx)
+	go func() {
+		select {
+		case <-ctx.Done():
+			taskCancel()
+		case <-p.rootCtx.Done():
+			taskCancel()
+		}
+	}()
+
 	switch p.submitBehavior {
 	case SubmitBlock:
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case p.tasksChan <- taskWrapper{task: task, ctx: ctx, taskID: id}:
+		case p.tasksChan <- taskWrapper{task: task, ctx: taskCtx, taskID: taskID}:
 			return nil
 		}
 	case SubmitError:
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case p.tasksChan <- taskWrapper{task: task, ctx: ctx, taskID: id}:
+		case p.tasksChan <- taskWrapper{task: task, ctx: taskCtx, taskID: taskID}:
 			return nil
 		default:
 			return errors.New("task queue is full")
 		}
 	}
 	return nil
-}
-
-func SubmitWithRateLimit(ctx context.Context, pool *Pool, limiter RateLimiter, task func(context.Context) error) error {
-	if err := limiter.Wait(ctx); err != nil {
-		return err
-	}
-	return pool.Submit(ctx, task)
 }
 
 // Wait blocks until all submitted tasks have finished, then returns any aggregated error.
