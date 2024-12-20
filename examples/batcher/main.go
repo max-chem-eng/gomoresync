@@ -8,6 +8,7 @@ import (
 	"github.com/max-chem-eng/gomoresync"
 )
 
+// Run this example to see how the batcher works.
 func main() {
 	// Flush function simply prints the batched items
 	flushFn := func(items []interface{}) {
